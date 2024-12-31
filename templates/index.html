@@ -28,6 +28,36 @@
         .progress {
             height: 25px;
         }
+        .progress-container {
+            margin-bottom: 15px;
+        }
+        #stop-button {
+            display: none;
+        }
+        #log-container {
+            margin-top: 20px;
+            max-height: 300px;
+            overflow-y: auto;
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .log-message {
+            margin: 2px 0;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .ffmpeg-output {
+            color: #0066cc;
+        }
+        .error-message {
+            color: #dc3545;
+        }
+        .success-message {
+            color: #198754;
+        }
     </style>
 </head>
 <body>
@@ -50,15 +80,26 @@
 
         <div id="progress-container" style="display: none;">
             <h3>Conversion Progress:</h3>
-            <div class="progress mb-3">
-                <div class="progress-bar" role="progressbar" style="width: 0%"></div>
+            <div class="progress-container">
+                <div class="progress">
+                    <div class="progress-bar" role="progressbar" style="width: 0%"></div>
+                </div>
+                <div id="status-text" class="text-muted mt-2"></div>
+                <div id="file-progress-text" class="text-muted"></div>
             </div>
-            <div id="status-text" class="text-muted"></div>
+            <button id="stop-button" class="btn btn-danger" onclick="stopConversion()">Stop Conversion</button>
+            
+            <div id="log-container">
+                <div id="log-messages"></div>
+            </div>
         </div>
     </div>
 
     <script>
         let sequences = {};
+        let progressInterval = null;
+        let isConverting = false;
+        let lastLogCount = 0;
 
         async function scanFolder() {
             const folderPath = document.getElementById('folderPath').value;
@@ -114,6 +155,90 @@
             container.style.display = 'block';
         }
 
+        function updateLogMessages(messages) {
+            const logContainer = document.getElementById('log-messages');
+            
+            // Only update if we have new messages
+            if (messages.length <= lastLogCount) return;
+            
+            // Add new messages
+            for (let i = lastLogCount; i < messages.length; i++) {
+                const message = messages[i];
+                const div = document.createElement('div');
+                div.className = 'log-message';
+                
+                // Style different types of messages
+                if (message.includes('FFmpeg:')) {
+                    div.classList.add('ffmpeg-output');
+                } else if (message.includes('error') || message.includes('Error')) {
+                    div.classList.add('error-message');
+                } else if (message.includes('completed successfully')) {
+                    div.classList.add('success-message');
+                }
+                
+                div.textContent = message;
+                logContainer.appendChild(div);
+            }
+            
+            lastLogCount = messages.length;
+            
+            // Scroll to bottom
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        async function updateProgress() {
+            if (!isConverting) return;
+
+            try {
+                const response = await fetch('/progress');
+                const data = await response.json();
+                
+                const progressBar = document.querySelector('.progress-bar');
+                const statusText = document.getElementById('status-text');
+                const fileProgressText = document.getElementById('file-progress-text');
+                const stopButton = document.getElementById('stop-button');
+                
+                // Update overall progress
+                const overallProgress = (((data.current_file_index - 1) * 100) + data.progress) / data.total_files;
+                progressBar.style.width = `${overallProgress}%`;
+                progressBar.textContent = `${Math.round(overallProgress)}%`;
+                
+                // Update status text
+                if (data.is_converting) {
+                    statusText.textContent = `Converting file ${data.current_file_index} of ${data.total_files}`;
+                    fileProgressText.textContent = `Current file: ${data.current_file} (${Math.round(data.progress)}%)`;
+                    stopButton.style.display = 'block';
+                } else {
+                    if (data.current_file_index === data.total_files) {
+                        statusText.textContent = 'All conversions completed!';
+                        fileProgressText.textContent = '';
+                        stopButton.style.display = 'none';
+                        isConverting = false;
+                        clearInterval(progressInterval);
+                    }
+                }
+                
+                // Update logs
+                updateLogMessages(data.log_messages);
+            } catch (error) {
+                console.error('Error updating progress:', error);
+            }
+        }
+
+        async function stopConversion() {
+            try {
+                const response = await fetch('/stop', {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                if (result.success) {
+                    document.getElementById('status-text').textContent = 'Stopping conversion...';
+                }
+            } catch (error) {
+                console.error('Error stopping conversion:', error);
+            }
+        }
+
         async function convertSelected() {
             const selected = Array.from(document.querySelectorAll('input[type="checkbox"]:checked'))
                 .map(cb => cb.value);
@@ -124,39 +249,52 @@
             }
 
             const progressContainer = document.getElementById('progress-container');
-            const progressBar = document.querySelector('.progress-bar');
-            const statusText = document.getElementById('status-text');
             progressContainer.style.display = 'block';
 
-            for (let i = 0; i < selected.length; i++) {
-                const key = selected[i];
-                const sequence = sequences[key];
-                
-                statusText.textContent = `Converting: ${sequence.base_name} (${i + 1}/${selected.length})`;
-                progressBar.style.width = `${((i + 1) / selected.length) * 100}%`;
-                progressBar.textContent = `${Math.round(((i + 1) / selected.length) * 100)}%`;
+            // Reset progress display
+            const progressBar = document.querySelector('.progress-bar');
+            const statusText = document.getElementById('status-text');
+            const fileProgressText = document.getElementById('file-progress-text');
+            const stopButton = document.getElementById('stop-button');
+            const logMessages = document.getElementById('log-messages');
+            
+            progressBar.style.width = '0%';
+            progressBar.textContent = '0%';
+            statusText.textContent = 'Starting conversion...';
+            fileProgressText.textContent = '';
+            stopButton.style.display = 'block';
+            logMessages.innerHTML = '';
+            lastLogCount = 0;
 
-                try {
-                    const response = await fetch('/convert', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({
-                            sequence_info: sequence
-                        })
-                    });
+            // Prepare sequences info
+            const sequencesToConvert = selected.map(key => sequences[key]);
 
-                    const result = await response.json();
-                    if (!result.success) {
-                        alert(`Error converting ${sequence.base_name}: ${result.error}`);
-                    }
-                } catch (error) {
-                    alert(`Error converting ${sequence.base_name}: ${error}`);
+            try {
+                const response = await fetch('/convert', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        sequences_info: sequencesToConvert
+                    })
+                });
+
+                const result = await response.json();
+                if (!result.success) {
+                    alert(`Error starting conversion: ${result.error}`);
+                    return;
                 }
-            }
 
-            statusText.textContent = 'All conversions completed!';
+                // Start progress polling
+                isConverting = true;
+                if (progressInterval) {
+                    clearInterval(progressInterval);
+                }
+                progressInterval = setInterval(updateProgress, 500);
+            } catch (error) {
+                alert(`Error starting conversion: ${error}`);
+            }
         }
     </script>
 </body>
