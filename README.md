@@ -2,6 +2,10 @@
 
 A Flask web application that converts image sequences to MP4 videos using FFmpeg.
 
+<img src="screenshot.png" alt="Application Screenshot" width="600"/>
+
+[Click here for full-size screenshot](screenshot.png)
+
 ## Prerequisites
 
 - Python 3.7 or higher
