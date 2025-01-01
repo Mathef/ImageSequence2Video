@@ -113,17 +113,59 @@ def convert_to_video(sequence_info, output_name=None):
     add_log_message(f"Output path: {output_path}")
     add_log_message(f"Start frame: {sequence_info['start_frame']}, Total frames: {sequence_info['count']}")
     
+    # First, get the resolution of the first image
+    probe_cmd = [
+        'ffmpeg',
+        '-i', os.path.join(sequence_info['folder'], 
+                          sequence_info['pattern'] % sequence_info['start_frame']),
+    ]
+    
+    try:
+        probe_process = subprocess.Popen(
+            probe_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        _, probe_output = probe_process.communicate()
+        
+        # Extract resolution from probe output
+        resolution_match = re.search(r'Stream #0:0:.*?(\d+)x(\d+)', probe_output)
+        if resolution_match:
+            width = int(resolution_match.group(1))
+            height = int(resolution_match.group(2))
+            add_log_message(f"Detected resolution: {width}x{height}")
+            
+            # Calculate padding if needed
+            pad_width = width + (width % 2)
+            pad_height = height + (height % 2)
+            
+            if pad_width != width or pad_height != height:
+                add_log_message(f"Adding padding to make dimensions even: {pad_width}x{pad_height}")
+                filter_complex = f"pad={pad_width}:{pad_height}:(ow-iw)/2:(oh-ih)/2:color=black"
+            else:
+                filter_complex = None
+    except Exception as e:
+        add_log_message(f"Error detecting resolution: {e}")
+        return False, str(e)
+    
     cmd = [
         'ffmpeg', '-framerate', '24',
-        '-start_number', str(sequence_info['start_frame']),  # Add start frame number
+        '-start_number', str(sequence_info['start_frame']),
         '-i', input_pattern,
+    ]
+    
+    if filter_complex:
+        cmd.extend(['-vf', filter_complex])
+    
+    cmd.extend([
         '-c:v', 'libx264',
         '-pix_fmt', 'yuv420p',
         '-progress', 'pipe:1',
         '-stats',
         '-y',  # Overwrite output file if exists
         output_path
-    ]
+    ])
     
     add_log_message(f"Running command: {' '.join(cmd)}")
     
@@ -185,35 +227,44 @@ def convert_sequences(sequences_to_convert):
     """Convert multiple sequences and track progress"""
     global conversion_progress, current_process
     
-    current_process['should_stop'] = False
-    conversion_progress['is_converting'] = True
-    conversion_progress['total_files'] = len(sequences_to_convert)
-    conversion_progress['current_file_index'] = 0
-    conversion_progress['log_messages'] = []
-    
-    add_log_message(f"Starting conversion of {len(sequences_to_convert)} sequences")
-    
-    for sequence in sequences_to_convert:
-        if current_process['should_stop']:
-            add_log_message("Conversion process stopped")
-            break
-            
-        conversion_progress['current_file'] = sequence['base_name']
-        conversion_progress['current_file_index'] += 1
+    try:
+        current_process['should_stop'] = False
+        conversion_progress['is_converting'] = True
+        conversion_progress['total_files'] = len(sequences_to_convert)
+        conversion_progress['current_file_index'] = 0
+        conversion_progress['log_messages'] = []
         conversion_progress['progress'] = 0
         
-        add_log_message(f"Processing sequence {conversion_progress['current_file_index']} of {conversion_progress['total_files']}")
-        success, result = convert_to_video(sequence)
+        add_log_message(f"Starting conversion of {len(sequences_to_convert)} sequences")
         
-        if not success:
-            add_log_message(f"Error converting {sequence['base_name']}: {result}")
+        for i, sequence in enumerate(sequences_to_convert, 1):
             if current_process['should_stop']:
+                add_log_message("Conversion process stopped by user")
                 break
-    
-    conversion_progress['is_converting'] = False
-    conversion_progress['progress'] = 100
-    current_process['should_stop'] = False
-    add_log_message("All conversions completed")
+                
+            conversion_progress['current_file'] = sequence['base_name']
+            conversion_progress['current_file_index'] = i
+            conversion_progress['progress'] = 0
+            
+            add_log_message(f"Processing sequence {i} of {conversion_progress['total_files']}")
+            success, result = convert_to_video(sequence)
+            
+            if not success:
+                add_log_message(f"Error converting {sequence['base_name']}: {result}")
+                if current_process['should_stop']:
+                    break
+        
+    finally:
+        conversion_progress['is_converting'] = False
+        conversion_progress['progress'] = 100
+        current_process['should_stop'] = False
+        if current_process['process']:
+            try:
+                current_process['process'].terminate()
+            except:
+                pass
+            current_process['process'] = None
+        add_log_message("All conversions completed")
 
 @app.route('/')
 def index():
@@ -245,13 +296,16 @@ def convert_sequence():
 @app.route('/stop', methods=['POST'])
 def stop_conversion():
     """Stop the current conversion process"""
-    current_process['should_stop'] = True
-    if current_process['process']:
-        try:
+    try:
+        current_process['should_stop'] = True
+        if current_process['process']:
             current_process['process'].terminate()
-        except Exception as e:
-            add_log_message(f"Error stopping process: {e}")
-    return jsonify({'success': True, 'message': 'Stopping conversion...'})
+            current_process['process'] = None
+        add_log_message("Stopping conversion process...")
+        return jsonify({'success': True, 'message': 'Stopping conversion...'})
+    except Exception as e:
+        add_log_message(f"Error stopping process: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/progress')
 def get_progress():

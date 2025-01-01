@@ -74,6 +74,14 @@
 
         <div id="sequences-container" class="mb-4" style="display: none;">
             <h3>Found Sequences:</h3>
+            <div class="mb-3">
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="select-all" onchange="toggleSelectAll()">
+                    <label class="form-check-label" for="select-all">
+                        <strong>Select All Sequences</strong>
+                    </label>
+                </div>
+            </div>
             <div id="sequences-list"></div>
             <button class="btn btn-success mt-3" onclick="convertSelected()">Convert Selected Sequences</button>
         </div>
@@ -131,6 +139,30 @@
             }
         }
 
+        function toggleSelectAll() {
+            const selectAllCheckbox = document.getElementById('select-all');
+            const checkboxes = document.querySelectorAll('#sequences-list input[type="checkbox"]');
+            checkboxes.forEach(checkbox => {
+                checkbox.checked = selectAllCheckbox.checked;
+            });
+        }
+
+        function updateSelectAllState() {
+            const selectAllCheckbox = document.getElementById('select-all');
+            const checkboxes = Array.from(document.querySelectorAll('#sequences-list input[type="checkbox"]'));
+            
+            if (checkboxes.length === 0) {
+                selectAllCheckbox.checked = false;
+                return;
+            }
+            
+            const allChecked = checkboxes.every(cb => cb.checked);
+            const someChecked = checkboxes.some(cb => cb.checked);
+            
+            selectAllCheckbox.checked = allChecked;
+            selectAllCheckbox.indeterminate = someChecked && !allChecked;
+        }
+
         function displaySequences() {
             const container = document.getElementById('sequences-container');
             const list = document.getElementById('sequences-list');
@@ -141,7 +173,8 @@
                 item.className = 'sequence-item';
                 item.innerHTML = `
                     <div class="form-check">
-                        <input class="form-check-input" type="checkbox" value="${key}" id="seq_${key}">
+                        <input class="form-check-input" type="checkbox" value="${key}" 
+                               id="seq_${key}" onchange="updateSelectAllState()">
                         <label class="form-check-label" for="seq_${key}">
                             <strong>${sequence.base_name}</strong><br>
                             Location: ${sequence.folder}<br>
@@ -153,6 +186,7 @@
             });
 
             container.style.display = 'block';
+            updateSelectAllState();
         }
 
         function updateLogMessages(messages) {
@@ -199,14 +233,22 @@
                 const stopButton = document.getElementById('stop-button');
                 
                 // Update overall progress
-                const overallProgress = (((data.current_file_index - 1) * 100) + data.progress) / data.total_files;
-                progressBar.style.width = `${overallProgress}%`;
+                let overallProgress = 0;
+                if (data.total_files > 0) {
+                    overallProgress = (((data.current_file_index - 1) * 100) + data.progress) / data.total_files;
+                }
+                progressBar.style.width = `${Math.max(0, Math.min(100, overallProgress))}%`;
                 progressBar.textContent = `${Math.round(overallProgress)}%`;
                 
                 // Update status text
                 if (data.is_converting) {
-                    statusText.textContent = `Converting file ${data.current_file_index} of ${data.total_files}`;
-                    fileProgressText.textContent = `Current file: ${data.current_file} (${Math.round(data.progress)}%)`;
+                    if (data.current_file_index > 0) {
+                        statusText.textContent = `Converting file ${data.current_file_index} of ${data.total_files}`;
+                        fileProgressText.textContent = `Current file: ${data.current_file} (${Math.round(data.progress)}%)`;
+                    } else {
+                        statusText.textContent = 'Starting conversion...';
+                        fileProgressText.textContent = '';
+                    }
                     stopButton.style.display = 'block';
                 } else {
                     if (data.current_file_index === data.total_files) {
@@ -233,6 +275,20 @@
                 const result = await response.json();
                 if (result.success) {
                     document.getElementById('status-text').textContent = 'Stopping conversion...';
+                    document.getElementById('stop-button').disabled = true;
+                    // Wait a bit and check if conversion actually stopped
+                    setTimeout(async () => {
+                        const progressResponse = await fetch('/progress');
+                        const progressData = await progressResponse.json();
+                        if (!progressData.is_converting) {
+                            isConverting = false;
+                            clearInterval(progressInterval);
+                            document.getElementById('status-text').textContent = 'Conversion stopped';
+                            document.getElementById('stop-button').style.display = 'none';
+                        }
+                    }, 1000);
+                } else {
+                    alert('Failed to stop conversion: ' + (result.error || 'Unknown error'));
                 }
             } catch (error) {
                 console.error('Error stopping conversion:', error);
@@ -240,7 +296,7 @@
         }
 
         async function convertSelected() {
-            const selected = Array.from(document.querySelectorAll('input[type="checkbox"]:checked'))
+            const selected = Array.from(document.querySelectorAll('#sequences-list input[type="checkbox"]:checked'))
                 .map(cb => cb.value);
 
             if (selected.length === 0) {
@@ -263,6 +319,7 @@
             statusText.textContent = 'Starting conversion...';
             fileProgressText.textContent = '';
             stopButton.style.display = 'block';
+            stopButton.disabled = false;
             logMessages.innerHTML = '';
             lastLogCount = 0;
 
