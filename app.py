@@ -67,21 +67,28 @@ def find_image_sequences(folder_path):
                 match = re.match(r'(.+?)(\d+)\.(png|jpg|jpeg)$', file.lower())
                 if match:
                     base_name = match.group(1)
+                    frame_number = int(match.group(2))
                     if base_name not in file_groups:
                         file_groups[base_name] = []
-                    file_groups[base_name].append(file)
+                    file_groups[base_name].append((frame_number, file))
         
         # Only keep groups with more than 1 image
         for base_name, files in file_groups.items():
             if len(files) > 1:
+                # Sort files by frame number
+                sorted_files = sorted(files, key=lambda x: x[0])
+                start_frame = sorted_files[0][0]
+                
                 rel_path = os.path.relpath(root, folder_path)
                 sequence_key = os.path.join(rel_path, base_name)
                 sequences[sequence_key] = {
                     'base_name': base_name,
                     'folder': root,
                     'count': len(files),
-                    'pattern': f"{base_name}%05d.{files[0].split('.')[-1]}"
+                    'start_frame': start_frame,
+                    'pattern': f"{base_name}%05d.{sorted_files[0][1].split('.')[-1]}"
                 }
+                add_log_message(f"Found sequence: {base_name} with {len(files)} frames, starting at frame {start_frame}")
     
     return sequences
 
@@ -104,9 +111,11 @@ def convert_to_video(sequence_info, output_name=None):
     add_log_message(f"Starting conversion of {sequence_info['base_name']}")
     add_log_message(f"Input pattern: {input_pattern}")
     add_log_message(f"Output path: {output_path}")
+    add_log_message(f"Start frame: {sequence_info['start_frame']}, Total frames: {sequence_info['count']}")
     
     cmd = [
         'ffmpeg', '-framerate', '24',
+        '-start_number', str(sequence_info['start_frame']),  # Add start frame number
         '-i', input_pattern,
         '-c:v', 'libx264',
         '-pix_fmt', 'yuv420p',
