@@ -92,7 +92,7 @@ def find_image_sequences(folder_path):
     
     return sequences
 
-def convert_to_video(sequence_info, output_name=None):
+def convert_to_video(sequence_info, output_name=None, framerate=24):
     """Convert image sequence to MP4 using ffmpeg"""
     global conversion_progress, current_process
     
@@ -150,7 +150,7 @@ def convert_to_video(sequence_info, output_name=None):
         return False, str(e)
     
     cmd = [
-        'ffmpeg', '-framerate', '24',
+        'ffmpeg', '-framerate', str(framerate),
         '-start_number', str(sequence_info['start_frame']),
         '-i', input_pattern,
     ]
@@ -246,8 +246,9 @@ def convert_sequences(sequences_to_convert):
             conversion_progress['current_file_index'] = i
             conversion_progress['progress'] = 0
             
-            add_log_message(f"Processing sequence {i} of {conversion_progress['total_files']}")
-            success, result = convert_to_video(sequence)
+            framerate = sequence.get('framerate', 24)
+            add_log_message(f"Processing sequence {i} of {conversion_progress['total_files']} at {framerate} fps")
+            success, result = convert_to_video(sequence, framerate=framerate)
             
             if not success:
                 add_log_message(f"Error converting {sequence['base_name']}: {result}")
@@ -286,6 +287,11 @@ def convert_sequence():
     
     if not sequences_info:
         return jsonify({'error': 'No sequences provided'}), 400
+        
+    # Ensure each sequence has a framerate
+    for sequence in sequences_info:
+        if 'framerate' not in sequence:
+            sequence['framerate'] = 24  # Default to 24 if not specified
     
     # Start conversion in a separate thread
     thread = threading.Thread(target=convert_sequences, args=(sequences_info,))

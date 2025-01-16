@@ -82,6 +82,10 @@
                     </label>
                 </div>
             </div>
+            <div class="mb-3">
+                <label for="defaultFramerate" class="form-label">Frame Rate (fps):</label>
+                <input type="number" class="form-control" id="defaultFramerate" value="24" min="1" max="120" style="width: 100px;">
+            </div>
             <div id="sequences-list"></div>
             <button class="btn btn-success mt-3" onclick="convertSelected()">Convert Selected Sequences</button>
         </div>
@@ -304,6 +308,15 @@
                 return;
             }
 
+            // Get the framerate value
+            const framerate = parseInt(document.getElementById('defaultFramerate').value) || 24;
+
+            // Prepare sequences info with framerate
+            const sequencesToConvert = selected.map(key => ({
+                ...sequences[key],
+                framerate: framerate
+            }));
+
             const progressContainer = document.getElementById('progress-container');
             progressContainer.style.display = 'block';
 
@@ -322,9 +335,6 @@
             stopButton.disabled = false;
             logMessages.innerHTML = '';
             lastLogCount = 0;
-
-            // Prepare sequences info
-            const sequencesToConvert = selected.map(key => sequences[key]);
 
             try {
                 const response = await fetch('/convert', {
