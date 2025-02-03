@@ -48,8 +48,9 @@ def parse_ffmpeg_progress(line):
             frame_match = re.search(r'frame=\s*(\d+)', line)
             if frame_match:
                 frame = int(frame_match.group(1))
-                # Calculate progress based on frame count and total frames
-                return min(99, (frame / conversion_progress.get('total_frames', 240)) * 100)
+                # Calculate progress based on frame count and total frames (including loops)
+                total_frames = conversion_progress.get('total_frames', 240)
+                return min(99, (frame / total_frames) * 100)
         except Exception as e:
             logger.error(f"Error parsing progress: {e}")
     return None
@@ -105,13 +106,14 @@ def convert_to_video(sequence_info, output_name=None, framerate=24):
     output_path = os.path.join(sequence_info['folder'], output_name)
     input_pattern = os.path.join(sequence_info['folder'], sequence_info['pattern'])
     
-    # Store total frames for progress calculation
-    conversion_progress['total_frames'] = sequence_info['count']
+    # Store total frames for progress calculation, accounting for loop count
+    loop_count = sequence_info.get('loop_count', 1)
+    conversion_progress['total_frames'] = sequence_info['count'] * loop_count
     
-    add_log_message(f"Starting conversion of {sequence_info['base_name']}")
+    add_log_message(f"Starting conversion of {sequence_info['base_name']} with {loop_count} repetition(s)")
     add_log_message(f"Input pattern: {input_pattern}")
     add_log_message(f"Output path: {output_path}")
-    add_log_message(f"Start frame: {sequence_info['start_frame']}, Total frames: {sequence_info['count']}")
+    add_log_message(f"Start frame: {sequence_info['start_frame']}, Total frames: {sequence_info['count'] * loop_count}")
     
     # First, get the resolution of the first image
     probe_cmd = [
@@ -152,8 +154,14 @@ def convert_to_video(sequence_info, output_name=None, framerate=24):
     cmd = [
         'ffmpeg', '-framerate', str(framerate),
         '-start_number', str(sequence_info['start_frame']),
-        '-i', input_pattern,
     ]
+
+    # Add stream loop if specified
+    loop_count = sequence_info.get('loop_count', 1)
+    if loop_count > 1:
+        cmd.extend(['-stream_loop', str(loop_count - 1)])  # -1 because FFmpeg plays once then loops n times
+
+    cmd.extend(['-i', input_pattern])
     
     if filter_complex:
         cmd.extend(['-vf', filter_complex])
