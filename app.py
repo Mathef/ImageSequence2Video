@@ -159,19 +159,30 @@ def convert_to_video(sequence_info, output_name=None, framerate=24):
     # Add stream loop if specified
     loop_count = sequence_info.get('loop_count', 1)
     if loop_count > 1:
-        cmd.extend(['-stream_loop', str(loop_count - 1)])  # -1 because FFmpeg plays once then loops n times
+        cmd.extend(['-stream_loop', str(loop_count - 1)])
 
     cmd.extend(['-i', input_pattern])
+    
+    # Calculate total duration in seconds
+    total_frames = sequence_info['count'] * loop_count
+    duration_seconds = total_frames / framerate
+    
+    # Generate silent audio track with aevalsrc instead of anullsrc
+    cmd.extend([
+        '-f', 'lavfi', 
+        '-i', f'aevalsrc=0:d={duration_seconds}:s=48000',
+    ])
     
     if filter_complex:
         cmd.extend(['-vf', filter_complex])
     
     cmd.extend([
         '-c:v', 'libx264',
+        '-c:a', 'aac',
         '-pix_fmt', 'yuv420p',
         '-progress', 'pipe:1',
         '-stats',
-        '-y',  # Overwrite output file if exists
+        '-y',
         output_path
     ])
     
