@@ -33,7 +33,9 @@ python app.py
 
 5. Select the sequences you want to convert
 
-6. Click "Convert Selected Sequences" to start the conversion process
+6. Adjust framerate and loop count settings as needed
+
+7. Click "Convert Selected Sequences" to start the conversion process
 
 ## Features
 
@@ -41,14 +43,19 @@ python app.py
 - Supports PNG, JPG, and JPEG formats
 - Automatically detects image sequences based on naming patterns
 - Converts sequences to MP4 using H.264 codec
-- Shows conversion progress
+- Adds silent audio track for better TV/device compatibility
+- Supports custom framerate settings
+- Allows looping sequences multiple times
+- Shows real-time conversion progress and detailed logs
+- Handles odd-dimension images by adding padding
 - Names output videos based on sequence names
 
 ## Notes
 
 - Image sequences should be numbered consecutively
 - The application uses FFmpeg with the following settings:
-  - Framerate: 24 fps
-  - Codec: H.264
+  - Codec: H.264 (video), AAC (audio)
   - Pixel format: yuv420p
-- Output videos will be saved in the same folder as the image sequences 
+  - Silent audio track: 48kHz sample rate
+- Output videos will be saved in the same folder as the image sequences
+- The conversion can be stopped at any time using the "Stop Conversion" button
