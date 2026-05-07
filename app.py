@@ -64,14 +64,16 @@ def find_image_sequences(folder_path):
         file_groups = {}
         for file in files:
             if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                # Extract the base name and number
-                match = re.match(r'(.+?)(\d+)\.(png|jpg|jpeg)$', file.lower())
+                # Extract base name, digits, and extension (keep original case in base name)
+                match = re.match(r'(.+?)(\d+)\.(png|jpg|jpeg)$', file, flags=re.IGNORECASE)
                 if match:
                     base_name = match.group(1)
-                    frame_number = int(match.group(2))
+                    frame_digits = match.group(2)
+                    frame_number = int(frame_digits)
+                    pad_len = len(frame_digits)
                     if base_name not in file_groups:
                         file_groups[base_name] = []
-                    file_groups[base_name].append((frame_number, file))
+                    file_groups[base_name].append((frame_number, file, pad_len))
         
         # Only keep groups with more than 1 image
         for base_name, files in file_groups.items():
@@ -79,6 +81,7 @@ def find_image_sequences(folder_path):
                 # Sort files by frame number
                 sorted_files = sorted(files, key=lambda x: x[0])
                 start_frame = sorted_files[0][0]
+                pad_len = max(f[2] for f in sorted_files)
                 
                 rel_path = os.path.relpath(root, folder_path)
                 sequence_key = os.path.join(rel_path, base_name)
@@ -87,7 +90,7 @@ def find_image_sequences(folder_path):
                     'folder': root,
                     'count': len(files),
                     'start_frame': start_frame,
-                    'pattern': f"{base_name}%05d.{sorted_files[0][1].split('.')[-1]}"
+                    'pattern': f"{base_name}%0{pad_len}d.{sorted_files[0][1].split('.')[-1]}"
                 }
                 add_log_message(f"Found sequence: {base_name} with {len(files)} frames, starting at frame {start_frame}")
     
@@ -116,10 +119,18 @@ def convert_to_video(sequence_info, output_name=None, framerate=24):
     add_log_message(f"Start frame: {sequence_info['start_frame']}, Total frames: {sequence_info['count'] * loop_count}")
     
     # First, get the resolution of the first image
+    filter_complex = None
+    first_frame_path = os.path.join(
+        sequence_info['folder'],
+        sequence_info['pattern'] % sequence_info['start_frame']
+    )
     probe_cmd = [
-        'ffmpeg',
-        '-i', os.path.join(sequence_info['folder'], 
-                          sequence_info['pattern'] % sequence_info['start_frame']),
+        'ffprobe',
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height',
+        '-of', 'json',
+        first_frame_path,
     ]
     
     try:
@@ -129,24 +140,34 @@ def convert_to_video(sequence_info, output_name=None, framerate=24):
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
-        _, probe_output = probe_process.communicate()
-        
-        # Extract resolution from probe output
-        resolution_match = re.search(r'Stream #0:0:.*?(\d+)x(\d+)', probe_output)
-        if resolution_match:
-            width = int(resolution_match.group(1))
-            height = int(resolution_match.group(2))
-            add_log_message(f"Detected resolution: {width}x{height}")
-            
-            # Calculate padding if needed
-            pad_width = width + (width % 2)
-            pad_height = height + (height % 2)
-            
-            if pad_width != width or pad_height != height:
-                add_log_message(f"Adding padding to make dimensions even: {pad_width}x{pad_height}")
-                filter_complex = f"pad={pad_width}:{pad_height}:(ow-iw)/2:(oh-ih)/2:color=black"
-            else:
-                filter_complex = None
+        probe_stdout, probe_stderr = probe_process.communicate()
+
+        if probe_process.returncode != 0:
+            add_log_message(f"ffprobe failed ({probe_process.returncode}): {probe_stderr.strip()}")
+        else:
+            try:
+                probe_json = json.loads(probe_stdout or "{}")
+                streams = probe_json.get("streams") or []
+                if streams and isinstance(streams[0], dict):
+                    width = int(streams[0].get("width") or 0)
+                    height = int(streams[0].get("height") or 0)
+                else:
+                    width = height = 0
+
+                if width > 0 and height > 0:
+                    add_log_message(f"Detected resolution: {width}x{height}")
+
+                    # Many encoders require even dimensions (e.g., yuv420p / H.264).
+                    pad_width = width + (width % 2)
+                    pad_height = height + (height % 2)
+
+                    if pad_width != width or pad_height != height:
+                        add_log_message(f"Adding padding to make dimensions even: {pad_width}x{pad_height}")
+                        filter_complex = f"pad={pad_width}:{pad_height}:(ow-iw)/2:(oh-ih)/2:color=black"
+                else:
+                    add_log_message("Could not detect resolution; skipping padding filter.")
+            except Exception as e:
+                add_log_message(f"Error parsing ffprobe output; skipping padding filter: {e}")
     except Exception as e:
         add_log_message(f"Error detecting resolution: {e}")
         return False, str(e)
