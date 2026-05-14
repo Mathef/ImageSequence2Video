@@ -16,6 +16,14 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max-limit
 app.config['UPLOAD_FOLDER'] = 'uploads'
 
+# libx264 CRF + preset per GUI "Quality" option (lower CRF = higher quality, larger files)
+ENCODE_QUALITY_PRESETS = {
+    'high': ('18', 'slow'),
+    'balanced': ('21', 'medium'),
+    'compact': ('24', 'slow'),
+    'draft': ('26', 'veryfast'),
+}
+
 # Global variables to store conversion state
 conversion_progress = {
     'current_file': '',
@@ -117,6 +125,12 @@ def convert_to_video(sequence_info, output_name=None, framerate=24):
     add_log_message(f"Input pattern: {input_pattern}")
     add_log_message(f"Output path: {output_path}")
     add_log_message(f"Start frame: {sequence_info['start_frame']}, Total frames: {sequence_info['count'] * loop_count}")
+
+    quality_key = sequence_info.get('encode_quality') or 'balanced'
+    crf, x264_preset = ENCODE_QUALITY_PRESETS.get(
+        quality_key, ENCODE_QUALITY_PRESETS['balanced']
+    )
+    add_log_message(f"Encode quality: {quality_key} (CRF {crf}, preset {x264_preset})")
     
     # First, get the resolution of the first image
     filter_complex = None
@@ -199,6 +213,8 @@ def convert_to_video(sequence_info, output_name=None, framerate=24):
     
     cmd.extend([
         '-c:v', 'libx264',
+        '-crf', crf,
+        '-preset', x264_preset,
         '-c:a', 'aac',
         '-pix_fmt', 'yuv420p',
         '-progress', 'pipe:1',
@@ -332,7 +348,10 @@ def convert_sequence():
     for sequence in sequences_info:
         if 'framerate' not in sequence:
             sequence['framerate'] = 24  # Default to 24 if not specified
-    
+        q = sequence.get('encode_quality')
+        if q not in ENCODE_QUALITY_PRESETS:
+            sequence['encode_quality'] = 'balanced'
+
     # Start conversion in a separate thread
     thread = threading.Thread(target=convert_sequences, args=(sequences_info,))
     thread.start()

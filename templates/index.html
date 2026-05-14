@@ -82,9 +82,20 @@
                     </label>
                 </div>
             </div>
-            <div class="mb-3">
-                <label for="defaultFramerate" class="form-label">Frame Rate (fps):</label>
-                <input type="number" class="form-control" id="defaultFramerate" value="24" min="1" max="120" style="width: 100px;">
+            <div class="row g-3 align-items-end mb-3">
+                <div class="col-auto">
+                    <label for="defaultFramerate" class="form-label">Frame Rate (fps):</label>
+                    <input type="number" class="form-control" id="defaultFramerate" value="24" min="1" max="120" style="width: 100px;">
+                </div>
+                <div class="col-auto">
+                    <label for="encodeQuality" class="form-label">Quality:</label>
+                    <select class="form-select" id="encodeQuality" style="min-width: 240px;" aria-label="Encode quality">
+                        <option value="high">High (CRF 18, slower)</option>
+                        <option value="balanced" selected>Balanced (CRF 21)</option>
+                        <option value="compact">Smaller file (CRF 24)</option>
+                        <option value="draft">Draft / fast (CRF 26)</option>
+                    </select>
+                </div>
             </div>
             <div id="sequences-list"></div>
             <button class="btn btn-success mt-3" onclick="convertSelected()">Convert Selected Sequences</button>
@@ -317,11 +328,13 @@
 
             // Get the framerate value
             const framerate = parseInt(document.getElementById('defaultFramerate').value) || 24;
+            const encodeQuality = document.getElementById('encodeQuality').value;
 
             // Prepare sequences info with framerate
             const sequencesToConvert = selected.map(key => ({
                 ...sequences[key],
                 framerate: framerate,
+                encode_quality: encodeQuality,
                 loop_count: parseInt(document.getElementById(`loop_${key}`).value) || 1
             }));
 
