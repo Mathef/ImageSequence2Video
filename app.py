@@ -4,9 +4,20 @@ import subprocess
 import threading
 import signal
 import logging
+import shutil
+import uuid
 from flask import Flask, render_template, request, jsonify
 from werkzeug.utils import secure_filename
 import json
+from PIL import Image
+import numpy as np
+
+try:
+    import OpenEXR
+    import Imath
+except ImportError:
+    OpenEXR = None
+    Imath = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,10 +35,13 @@ ENCODE_QUALITY_PRESETS = {
     'draft': ('26', 'veryfast'),
 }
 
+SUPPORTED_SEQUENCE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.exr')
+
 # Global variables to store conversion state
 conversion_progress = {
     'current_file': '',
     'progress': 0,
+    'current_stage': '',
     'total_files': 0,
     'current_file_index': 0,
     'is_converting': False,
@@ -63,6 +77,237 @@ def parse_ffmpeg_progress(line):
             logger.error(f"Error parsing progress: {e}")
     return None
 
+def sanitize_name(value):
+    """Return a filesystem-friendly name component."""
+    sanitized = re.sub(r'[^A-Za-z0-9._-]+', '_', str(value or '')).strip('._')
+    return sanitized or 'output'
+
+def is_exr_sequence(sequence_info):
+    return sequence_info.get('source_type') == 'exr'
+
+def get_first_frame_path(sequence_info):
+    return os.path.join(
+        sequence_info['folder'],
+        sequence_info['pattern'] % sequence_info['start_frame']
+    )
+
+def parse_pattern_padding(pattern):
+    match = re.search(r'%0(\d+)d', pattern)
+    if match:
+        return int(match.group(1))
+    fallback = re.search(r'%(\d+)d', pattern)
+    if fallback:
+        return int(fallback.group(1))
+    return 5
+
+def ensure_exr_dependencies():
+    if OpenEXR is None or Imath is None:
+        return (
+            False,
+            "OpenEXR Python package is not installed. "
+            "Install with: pip install OpenEXR (or conda install -c conda-forge openexr-python)."
+        )
+    return True, ""
+
+def get_exr_aov_map(first_frame_path):
+    """Return AOV map from EXR channel names."""
+    ok, error = ensure_exr_dependencies()
+    if not ok:
+        raise RuntimeError(error)
+    if not os.path.exists(first_frame_path):
+        raise FileNotFoundError(f"EXR frame not found: {first_frame_path}")
+
+    exr_file = OpenEXR.InputFile(first_frame_path)
+    header = exr_file.header()
+    raw_channels = sorted((header.get('channels') or {}).keys())
+    exr_file.close()
+
+    grouped = {}
+    top_level_channels = set(raw_channels)
+    has_beauty_rgb = all(channel in top_level_channels for channel in ('R', 'G', 'B'))
+    if has_beauty_rgb:
+        grouped['Beauty'] = {
+            'channels': {
+                'R': 'R',
+                'G': 'G',
+                'B': 'B',
+            }
+        }
+        if 'A' in top_level_channels:
+            grouped['Beauty']['channels']['A'] = 'A'
+
+    for channel_name in raw_channels:
+        if has_beauty_rgb and channel_name in ('R', 'G', 'B', 'A'):
+            # Top-level RGBA channels are exposed as a merged "Beauty" AOV.
+            continue
+        rgba_match = re.match(r'^(.*)\.([RGBA])$', channel_name)
+        if rgba_match:
+            group_name = rgba_match.group(1) or 'Beauty'
+            suffix = rgba_match.group(2)
+            grouped.setdefault(group_name, {'channels': {}})
+            grouped[group_name]['channels'][suffix] = channel_name
+        else:
+            grouped.setdefault(channel_name, {'channels': {}})
+            grouped[channel_name]['channels']['Y'] = channel_name
+
+    aov_map = {}
+    for aov_name, info in grouped.items():
+        channels = info['channels']
+        if all(c in channels for c in ('R', 'G', 'B')) or 'Y' in channels:
+            aov_map[aov_name] = info
+
+    return aov_map
+
+def list_exr_aovs(sequence_info):
+    first_frame_path = get_first_frame_path(sequence_info)
+    aov_map = get_exr_aov_map(first_frame_path)
+    return sorted(aov_map.keys()), aov_map
+
+def read_exr_channel(exr_file, channel_name, width, height):
+    pixel_type = Imath.PixelType(Imath.PixelType.FLOAT)
+    raw = exr_file.channel(channel_name, pixel_type)
+    channel_data = np.frombuffer(raw, dtype=np.float32)
+    if channel_data.size != width * height:
+        raise ValueError(f"Unexpected EXR channel size for {channel_name}")
+    return channel_data.reshape((height, width))
+
+def linear_to_srgb(rgb_linear):
+    """Convert linear RGB to display-referred sRGB."""
+    rgb_linear = np.clip(rgb_linear, 0.0, None)
+    return np.where(
+        rgb_linear <= 0.0031308,
+        rgb_linear * 12.92,
+        1.055 * np.power(rgb_linear, 1.0 / 2.4) - 0.055
+    )
+
+def convert_exr_frame_to_png(exr_path, png_path, aov_spec, aov_name):
+    exr_file = OpenEXR.InputFile(exr_path)
+    header = exr_file.header()
+    data_window = header['dataWindow']
+    width = data_window.max.x - data_window.min.x + 1
+    height = data_window.max.y - data_window.min.y + 1
+
+    channels = aov_spec['channels']
+    if all(c in channels for c in ('R', 'G', 'B')):
+        red = read_exr_channel(exr_file, channels['R'], width, height)
+        green = read_exr_channel(exr_file, channels['G'], width, height)
+        blue = read_exr_channel(exr_file, channels['B'], width, height)
+        rgb = np.stack([red, green, blue], axis=-1)
+    elif 'Y' in channels:
+        luminance = read_exr_channel(exr_file, channels['Y'], width, height)
+        rgb = np.stack([luminance, luminance, luminance], axis=-1)
+    else:
+        exr_file.close()
+        raise ValueError("AOV does not have RGB or single-channel data")
+
+    alpha = None
+    if 'A' in channels:
+        alpha = read_exr_channel(exr_file, channels['A'], width, height)
+    exr_file.close()
+
+    rgb = np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0)
+
+    # Composite over black when alpha exists.
+    if alpha is not None:
+        alpha = np.nan_to_num(alpha, nan=0.0, posinf=1.0, neginf=0.0)
+        alpha = np.clip(alpha, 0.0, 1.0)[..., np.newaxis]
+        rgb = rgb * alpha
+
+    # Beauty is usually stored in linear space, so convert to display-referred sRGB.
+    if str(aov_name).lower() == 'beauty':
+        rgb = linear_to_srgb(rgb)
+
+    rgb = np.clip(rgb, 0.0, 1.0)
+    rgb_u8 = (rgb * 255.0).astype(np.uint8)
+    Image.fromarray(rgb_u8, mode='RGB').save(png_path)
+
+def convert_exr_sequence_to_videos(sequence_info, framerate):
+    ok, error = ensure_exr_dependencies()
+    if not ok:
+        return False, error
+
+    try:
+        available_aovs, aov_map = list_exr_aovs(sequence_info)
+    except Exception as e:
+        return False, f"Failed to inspect EXR AOVs: {e}"
+
+    requested_aovs = sequence_info.get('selected_aovs') or available_aovs
+    selected_aovs = [aov for aov in requested_aovs if aov in aov_map]
+    if not selected_aovs:
+        return False, "No valid EXR AOV selected for conversion."
+
+    base_name = sequence_info['base_name'].strip('_')
+    pad_len = parse_pattern_padding(sequence_info['pattern'])
+    delete_temp_files = bool(sequence_info.get('delete_temp_files', True))
+    total_aovs = len(selected_aovs)
+    frame_numbers = range(
+        sequence_info['start_frame'],
+        sequence_info['start_frame'] + sequence_info['count']
+    )
+
+    for aov_index, aov_name in enumerate(selected_aovs, start=1):
+        if current_process['should_stop']:
+            return False, "Conversion stopped by user"
+
+        conversion_progress['current_stage'] = f"Preprocessing EXR to PNG ({aov_name}, {aov_index}/{total_aovs})"
+        conversion_progress['progress'] = 0
+        add_log_message(f"Preparing EXR AOV '{aov_name}' for {sequence_info['base_name']}")
+        safe_base = sanitize_name(base_name or sequence_info['base_name'])
+        safe_aov = sanitize_name(aov_name)
+        temp_dir_name = f".tmp_{safe_base}_{safe_aov}_{uuid.uuid4().hex[:8]}"
+        temp_dir = os.path.join(sequence_info['folder'], temp_dir_name)
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_pattern = f"frame_%0{pad_len}d.png"
+
+        try:
+            for frame_offset, frame_number in enumerate(frame_numbers, start=1):
+                if current_process['should_stop']:
+                    return False, "Conversion stopped by user"
+
+                source_frame = os.path.join(
+                    sequence_info['folder'],
+                    sequence_info['pattern'] % frame_number
+                )
+                if not os.path.exists(source_frame):
+                    raise FileNotFoundError(f"Missing EXR frame: {source_frame}")
+
+                png_frame = os.path.join(temp_dir, temp_pattern % frame_number)
+                convert_exr_frame_to_png(source_frame, png_frame, aov_map[aov_name], aov_name)
+                preprocess_ratio = frame_offset / max(sequence_info['count'], 1)
+                conversion_progress['progress'] = min(99, preprocess_ratio * 100.0)
+
+            temp_sequence = {
+                'base_name': f"{sequence_info['base_name']}_{safe_aov}",
+                'folder': temp_dir,
+                'count': sequence_info['count'],
+                'start_frame': sequence_info['start_frame'],
+                'pattern': temp_pattern,
+                'loop_count': sequence_info.get('loop_count', 1),
+                'encode_quality': sequence_info.get('encode_quality', 'balanced'),
+                'output_folder': sequence_info['folder'],
+            }
+            output_name = f"{safe_base}_{safe_aov}.mp4"
+            conversion_progress['current_stage'] = f"Creating MP4 ({aov_name}, {aov_index}/{total_aovs})"
+            conversion_progress['progress'] = 0
+            success, result = convert_to_video(
+                temp_sequence,
+                output_name=output_name,
+                framerate=framerate
+            )
+            if not success:
+                return False, result
+        finally:
+            if delete_temp_files:
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    add_log_message(f"Deleted temp folder: {temp_dir}")
+                except Exception as e:
+                    add_log_message(f"Failed to clean temp folder {temp_dir}: {e}")
+            else:
+                add_log_message(f"Keeping temp folder: {temp_dir}")
+
+    return True, "EXR conversion completed"
+
 def find_image_sequences(folder_path):
     """Find all image sequences in the given folder and subfolders"""
     sequences = {}
@@ -71,20 +316,22 @@ def find_image_sequences(folder_path):
         # Group files by their base name (without number)
         file_groups = {}
         for file in files:
-            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+            if file.lower().endswith(SUPPORTED_SEQUENCE_EXTENSIONS):
                 # Extract base name, digits, and extension (keep original case in base name)
-                match = re.match(r'(.+?)(\d+)\.(png|jpg|jpeg)$', file, flags=re.IGNORECASE)
+                match = re.match(r'(.+?)(\d+)\.(png|jpg|jpeg|exr)$', file, flags=re.IGNORECASE)
                 if match:
                     base_name = match.group(1)
                     frame_digits = match.group(2)
                     frame_number = int(frame_digits)
                     pad_len = len(frame_digits)
-                    if base_name not in file_groups:
-                        file_groups[base_name] = []
-                    file_groups[base_name].append((frame_number, file, pad_len))
+                    extension = match.group(3).lower()
+                    group_key = (base_name, extension)
+                    if group_key not in file_groups:
+                        file_groups[group_key] = []
+                    file_groups[group_key].append((frame_number, file, pad_len, extension))
         
         # Only keep groups with more than 1 image
-        for base_name, files in file_groups.items():
+        for (base_name, extension), files in file_groups.items():
             if len(files) > 1:
                 # Sort files by frame number
                 sorted_files = sorted(files, key=lambda x: x[0])
@@ -92,15 +339,21 @@ def find_image_sequences(folder_path):
                 pad_len = max(f[2] for f in sorted_files)
                 
                 rel_path = os.path.relpath(root, folder_path)
-                sequence_key = os.path.join(rel_path, base_name)
+                sequence_key = os.path.join(rel_path, f"{base_name}[{extension}]")
                 sequences[sequence_key] = {
                     'base_name': base_name,
                     'folder': root,
                     'count': len(files),
                     'start_frame': start_frame,
-                    'pattern': f"{base_name}%0{pad_len}d.{sorted_files[0][1].split('.')[-1]}"
+                    'pattern': f"{base_name}%0{pad_len}d.{extension}",
+                    'extension': extension,
+                    'source_type': 'exr' if extension == 'exr' else 'image',
+                    'selected_aovs': [],
                 }
-                add_log_message(f"Found sequence: {base_name} with {len(files)} frames, starting at frame {start_frame}")
+                add_log_message(
+                    f"Found {extension.upper()} sequence: {base_name} with {len(files)} "
+                    f"frames, starting at frame {start_frame}"
+                )
     
     return sequences
 
@@ -114,7 +367,8 @@ def convert_to_video(sequence_info, output_name=None, framerate=24):
     if output_name is None:
         output_name = sequence_info['base_name'].strip('_') + '.mp4'
     
-    output_path = os.path.join(sequence_info['folder'], output_name)
+    output_folder = sequence_info.get('output_folder', sequence_info['folder'])
+    output_path = os.path.join(output_folder, output_name)
     input_pattern = os.path.join(sequence_info['folder'], sequence_info['pattern'])
     
     # Store total frames for progress calculation, accounting for loop count
@@ -304,7 +558,11 @@ def convert_sequences(sequences_to_convert):
             
             framerate = sequence.get('framerate', 24)
             add_log_message(f"Processing sequence {i} of {conversion_progress['total_files']} at {framerate} fps")
-            success, result = convert_to_video(sequence, framerate=framerate)
+            if is_exr_sequence(sequence):
+                success, result = convert_exr_sequence_to_videos(sequence, framerate=framerate)
+            else:
+                conversion_progress['current_stage'] = "Creating MP4"
+                success, result = convert_to_video(sequence, framerate=framerate)
             
             if not success:
                 add_log_message(f"Error converting {sequence['base_name']}: {result}")
@@ -314,6 +572,7 @@ def convert_sequences(sequences_to_convert):
     finally:
         conversion_progress['is_converting'] = False
         conversion_progress['progress'] = 100
+        conversion_progress['current_stage'] = ''
         current_process['should_stop'] = False
         if current_process['process']:
             try:
@@ -351,18 +610,43 @@ def convert_sequence():
         q = sequence.get('encode_quality')
         if q not in ENCODE_QUALITY_PRESETS:
             sequence['encode_quality'] = 'balanced'
+        if is_exr_sequence(sequence):
+            selected_aovs = sequence.get('selected_aovs') or []
+            if not isinstance(selected_aovs, list):
+                sequence['selected_aovs'] = []
+            sequence['delete_temp_files'] = bool(sequence.get('delete_temp_files', True))
 
     # Start conversion in a separate thread
     thread = threading.Thread(target=convert_sequences, args=(sequences_info,))
     thread.start()
-    
+
     return jsonify({'success': True, 'message': 'Conversion started'})
+
+@app.route('/exr_aovs', methods=['POST'])
+def exr_aovs():
+    data = request.get_json() or {}
+    sequence_info = data.get('sequence_info') or {}
+
+    if not sequence_info or not is_exr_sequence(sequence_info):
+        return jsonify({'error': 'Invalid EXR sequence info'}), 400
+
+    try:
+        aov_names, _ = list_exr_aovs(sequence_info)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+    return jsonify({
+        'success': True,
+        'aovs': aov_names,
+        'selected_aovs': sequence_info.get('selected_aovs') or aov_names
+    })
 
 @app.route('/stop', methods=['POST'])
 def stop_conversion():
     """Stop the current conversion process"""
     try:
         current_process['should_stop'] = True
+        conversion_progress['current_stage'] = 'Stopping...'
         if current_process['process']:
             current_process['process'].terminate()
             current_process['process'] = None

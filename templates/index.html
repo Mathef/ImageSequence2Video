@@ -58,6 +58,17 @@
         .success-message {
             color: #198754;
         }
+        .exr-config-panel {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 10px;
+            margin-top: 10px;
+        }
+        .aov-list {
+            max-height: 180px;
+            overflow-y: auto;
+        }
     </style>
 </head>
 <body>
@@ -124,6 +135,10 @@
         let isConverting = false;
         let lastLogCount = 0;
 
+        function sequenceDomId(key) {
+            return key.replace(/[^a-zA-Z0-9_-]/g, '_');
+        }
+
         async function scanFolder() {
             const folderPath = document.getElementById('folderPath').value;
             if (!folderPath) {
@@ -156,7 +171,7 @@
 
         function toggleSelectAll() {
             const selectAllCheckbox = document.getElementById('select-all');
-            const checkboxes = document.querySelectorAll('#sequences-list input[type="checkbox"]');
+            const checkboxes = document.querySelectorAll('#sequences-list .sequence-checkbox');
             checkboxes.forEach(checkbox => {
                 checkbox.checked = selectAllCheckbox.checked;
             });
@@ -164,7 +179,7 @@
 
         function updateSelectAllState() {
             const selectAllCheckbox = document.getElementById('select-all');
-            const checkboxes = Array.from(document.querySelectorAll('#sequences-list input[type="checkbox"]'));
+            const checkboxes = Array.from(document.querySelectorAll('#sequences-list .sequence-checkbox'));
             
             if (checkboxes.length === 0) {
                 selectAllCheckbox.checked = false;
@@ -184,22 +199,46 @@
             list.innerHTML = '';
 
             Object.entries(sequences).forEach(([key, sequence]) => {
+                const domId = sequenceDomId(key);
+                const typeLabel = sequence.source_type === 'exr'
+                    ? 'EXR'
+                    : (sequence.extension || 'image').toUpperCase();
+                const exrControls = sequence.source_type === 'exr'
+                    ? `
+                        <div class="mt-2">
+                            <button type="button" class="btn btn-primary exr-config-btn"
+                                    data-sequence-key="${encodeURIComponent(key)}">
+                                Configure EXR
+                            </button>
+                        </div>
+                        <div class="form-check mt-2">
+                            <input class="form-check-input exr-delete-temp-checkbox" type="checkbox"
+                                   id="delete_temp_${domId}" checked>
+                            <label class="form-check-label" for="delete_temp_${domId}">
+                                Delete EXR temp PNG files after conversion
+                            </label>
+                        </div>
+                        <div id="exr_cfg_${domId}" class="exr-config-panel" style="display: none;"></div>
+                      `
+                    : '';
                 const item = document.createElement('div');
                 item.className = 'sequence-item';
                 item.innerHTML = `
                     <div class="form-check d-flex align-items-center">
                         <div class="flex-grow-1">
-                            <input class="form-check-input" type="checkbox" value="${key}" 
-                                   id="seq_${key}" onchange="updateSelectAllState()">
-                            <label class="form-check-label" for="seq_${key}">
+                            <input class="form-check-input sequence-checkbox" type="checkbox" value="${key}" data-sequence-key="${key}"
+                                   id="seq_${domId}" onchange="updateSelectAllState()">
+                            <label class="form-check-label" for="seq_${domId}">
                                 <strong>${sequence.base_name}</strong><br>
                                 Location: ${sequence.folder}<br>
-                                Images: ${sequence.count}
+                                Frames: ${sequence.count}<br>
+                                Type: ${typeLabel}
                             </label>
+                            ${exrControls}
                         </div>
                         <div class="ms-3" style="min-width: 150px;">
-                            <label class="form-label mb-0" for="loop_${key}">Loop Count:</label>
-                            <input type="number" class="form-control form-control-sm" id="loop_${key}" 
+                            <label class="form-label mb-0" for="loop_${domId}">Loop Count:</label>
+                            <input type="number" class="form-control form-control-sm" id="loop_${domId}" 
                                    value="1" min="1" style="width: 80px;">
                         </div>
                     </div>
@@ -207,8 +246,79 @@
                 list.appendChild(item);
             });
 
+            list.querySelectorAll('.exr-config-btn').forEach(button => {
+                button.addEventListener('click', () => {
+                    configureExr(decodeURIComponent(button.dataset.sequenceKey));
+                });
+            });
+
             container.style.display = 'block';
             updateSelectAllState();
+        }
+
+        async function configureExr(key) {
+            const sequence = sequences[key];
+            if (!sequence || sequence.source_type !== 'exr') return;
+
+            const panel = document.getElementById(`exr_cfg_${sequenceDomId(key)}`);
+            if (!panel) return;
+
+            panel.style.display = 'block';
+            panel.innerHTML = '<div class="text-muted">Loading EXR AOVs...</div>';
+
+            try {
+                const response = await fetch('/exr_aovs', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sequence_info: sequence })
+                });
+                const data = await response.json();
+
+                if (!response.ok || data.error) {
+                    panel.innerHTML = `<div class="text-danger">${data.error || 'Failed to load AOVs.'}</div>`;
+                    return;
+                }
+
+                const aovs = data.aovs || [];
+                if (aovs.length === 0) {
+                    panel.innerHTML = '<div class="text-muted">No AOVs found for this EXR sequence.</div>';
+                    return;
+                }
+
+                if (!Array.isArray(sequence.selected_aovs) || sequence.selected_aovs.length === 0) {
+                    sequence.selected_aovs = data.selected_aovs || aovs;
+                }
+                const selectedSet = new Set(sequence.selected_aovs);
+
+                panel.innerHTML = `
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <strong>AOVs to export</strong>
+                        <small class="text-muted">Multiple selection supported</small>
+                    </div>
+                    <div class="aov-list">
+                        ${aovs.map(aov => `
+                            <div class="form-check">
+                                <input class="form-check-input exr-aov-checkbox"
+                                       type="checkbox"
+                                       id="aov_${sequenceDomId(key)}_${sequenceDomId(aov)}"
+                                       data-aov-name="${aov}"
+                                       ${selectedSet.has(aov) ? 'checked' : ''}>
+                                <label class="form-check-label" for="aov_${sequenceDomId(key)}_${sequenceDomId(aov)}">${aov}</label>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+
+                panel.querySelectorAll('.exr-aov-checkbox').forEach(checkbox => {
+                    checkbox.addEventListener('change', () => {
+                        const selected = Array.from(panel.querySelectorAll('.exr-aov-checkbox:checked'))
+                            .map(cb => cb.dataset.aovName);
+                        sequences[key].selected_aovs = selected;
+                    });
+                });
+            } catch (error) {
+                panel.innerHTML = `<div class="text-danger">Error loading AOVs: ${error}</div>`;
+            }
         }
 
         function updateLogMessages(messages) {
@@ -255,10 +365,7 @@
                 const stopButton = document.getElementById('stop-button');
                 
                 // Update overall progress
-                let overallProgress = 0;
-                if (data.total_files > 0) {
-                    overallProgress = (((data.current_file_index - 1) * 100) + data.progress) / data.total_files;
-                }
+                const overallProgress = Math.max(0, Math.min(100, data.progress || 0));
                 progressBar.style.width = `${Math.max(0, Math.min(100, overallProgress))}%`;
                 progressBar.textContent = `${Math.round(overallProgress)}%`;
                 
@@ -266,7 +373,8 @@
                 if (data.is_converting) {
                     if (data.current_file_index > 0) {
                         statusText.textContent = `Converting file ${data.current_file_index} of ${data.total_files}`;
-                        fileProgressText.textContent = `Current file: ${data.current_file} (${Math.round(data.progress)}%)`;
+                        const stageSuffix = data.current_stage ? ` - ${data.current_stage}` : '';
+                        fileProgressText.textContent = `Current file: ${data.current_file}${stageSuffix} (${Math.round(data.progress)}%)`;
                     } else {
                         statusText.textContent = 'Starting conversion...';
                         fileProgressText.textContent = '';
@@ -318,8 +426,8 @@
         }
 
         async function convertSelected() {
-            const selected = Array.from(document.querySelectorAll('#sequences-list input[type="checkbox"]:checked'))
-                .map(cb => cb.value);
+            const selected = Array.from(document.querySelectorAll('#sequences-list .sequence-checkbox:checked'))
+                .map(cb => cb.dataset.sequenceKey);
 
             if (selected.length === 0) {
                 alert('Please select at least one sequence to convert');
@@ -335,7 +443,12 @@
                 ...sequences[key],
                 framerate: framerate,
                 encode_quality: encodeQuality,
-                loop_count: parseInt(document.getElementById(`loop_${key}`).value) || 1
+                selected_aovs: Array.isArray(sequences[key].selected_aovs) ? sequences[key].selected_aovs : [],
+                delete_temp_files: (() => {
+                    const checkbox = document.getElementById(`delete_temp_${sequenceDomId(key)}`);
+                    return checkbox ? checkbox.checked : true;
+                })(),
+                loop_count: parseInt(document.getElementById(`loop_${sequenceDomId(key)}`).value) || 1
             }));
 
             const progressContainer = document.getElementById('progress-container');
