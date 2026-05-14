@@ -6,6 +6,7 @@ import signal
 import logging
 import shutil
 import uuid
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from flask import Flask, render_template, request, jsonify
 from werkzeug.utils import secure_filename
 import json
@@ -36,6 +37,7 @@ ENCODE_QUALITY_PRESETS = {
 }
 
 SUPPORTED_SEQUENCE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.exr')
+EXR_PREPROCESS_WORKERS = 4
 
 # Global variables to store conversion state
 conversion_progress = {
@@ -221,6 +223,14 @@ def convert_exr_frame_to_png(exr_path, png_path, aov_spec, aov_name):
     rgb_u8 = (rgb * 255.0).astype(np.uint8)
     Image.fromarray(rgb_u8, mode='RGB').save(png_path)
 
+def preprocess_exr_frame_task(task):
+    """Process-pool worker for EXR -> PNG conversion."""
+    exr_path, png_path, aov_spec, aov_name, frame_number = task
+    if not os.path.exists(exr_path):
+        raise FileNotFoundError(f"Missing EXR frame: {exr_path}")
+    convert_exr_frame_to_png(exr_path, png_path, aov_spec, aov_name)
+    return frame_number
+
 def convert_exr_sequence_to_videos(sequence_info, framerate):
     ok, error = ensure_exr_dependencies()
     if not ok:
@@ -260,21 +270,47 @@ def convert_exr_sequence_to_videos(sequence_info, framerate):
         temp_pattern = f"frame_%0{pad_len}d.png"
 
         try:
-            for frame_offset, frame_number in enumerate(frame_numbers, start=1):
-                if current_process['should_stop']:
-                    return False, "Conversion stopped by user"
-
+            tasks = []
+            for frame_number in frame_numbers:
                 source_frame = os.path.join(
                     sequence_info['folder'],
                     sequence_info['pattern'] % frame_number
                 )
-                if not os.path.exists(source_frame):
-                    raise FileNotFoundError(f"Missing EXR frame: {source_frame}")
-
                 png_frame = os.path.join(temp_dir, temp_pattern % frame_number)
-                convert_exr_frame_to_png(source_frame, png_frame, aov_map[aov_name], aov_name)
-                preprocess_ratio = frame_offset / max(sequence_info['count'], 1)
-                conversion_progress['progress'] = min(99, preprocess_ratio * 100.0)
+                tasks.append((source_frame, png_frame, aov_map[aov_name], aov_name, frame_number))
+
+            total_tasks = len(tasks)
+            if total_tasks == 0:
+                raise ValueError("No frames found for EXR preprocessing")
+
+            worker_count = min(EXR_PREPROCESS_WORKERS, total_tasks)
+            add_log_message(
+                f"Preprocessing {total_tasks} EXR frames with {worker_count} parallel worker(s)"
+            )
+
+            completed_tasks = 0
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                future_to_frame = {
+                    executor.submit(preprocess_exr_frame_task, task): task[4]
+                    for task in tasks
+                }
+                for future in as_completed(future_to_frame):
+                    if current_process['should_stop']:
+                        for pending_future in future_to_frame:
+                            pending_future.cancel()
+                        return False, "Conversion stopped by user"
+
+                    frame_number = future_to_frame[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        for pending_future in future_to_frame:
+                            pending_future.cancel()
+                        return False, f"Failed EXR preprocessing at frame {frame_number}: {e}"
+
+                    completed_tasks += 1
+                    preprocess_ratio = completed_tasks / total_tasks
+                    conversion_progress['progress'] = min(99, preprocess_ratio * 100.0)
 
             temp_sequence = {
                 'base_name': f"{sequence_info['base_name']}_{safe_aov}",

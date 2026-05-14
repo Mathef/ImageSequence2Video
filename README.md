@@ -79,6 +79,7 @@ python app.py
 - Allows looping sequences multiple times
 - Shows real-time conversion progress and detailed logs
 - Shows stage-by-stage progress (EXR preprocessing first, then MP4 creation)
+- EXR preprocessing uses a small process pool (4 workers) for faster EXR to PNG conversion
 - Handles odd-dimension images by adding padding
 - Names output videos based on sequence names
 
